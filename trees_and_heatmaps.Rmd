@@ -1,0 +1,270 @@
+---
+title: "plotting_tree_in_R"
+author: "ijjL."
+date: "2026-04-19"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(ggtree)      # for tree + annotations
+library(treeio)      # for reading IQ-TREE files
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ape)         # for drop.tip / keep.tip
+library(pheatmap)    # for standalone heatmap
+library(ggnewscale)  # needed for gheatmap layering
+```
+
+```{r}
+raw <- read_lines("combine_gffs.txt")
+```
+
+# Split into blocks
+```{r}
+block_starts <- which(str_detect(raw, "^#FILE"))
+block_ends   <- c(block_starts[-1] - 1, length(raw))
+blocks       <- map2(block_starts, block_ends, ~ raw[.x:.y])
+```
+
+# Convert each block into a data frame
+```{r}
+parse_block <- function(block) {
+  block <- block[block != ""]
+  header_line <- str_remove(block[1], "^#")
+  header <- str_split(header_line, "\t")[[1]]
+  df <- map_df(block[-1], ~ {
+    vals <- str_split(.x, "\t")[[1]]
+    tibble(!!!set_names(as.list(vals), header))
+  })
+  df
+}
+
+amr_long <- map(blocks, parse_block) %>%
+  bind_rows(.id = "block_id") %>%
+  clean_names()
+```
+
+```{r}
+amr_clean <- amr_long %>%
+  mutate(across(-c(file, block_id), ~ na_if(., "."))) %>%
+  mutate(across(-c(file, block_id), ~ str_replace_all(., ";", ","))) %>%
+  pivot_longer(
+    cols = -c(file, block_id, num_found),
+    names_to = "raw_gene",
+    values_to = "identity"
+  ) %>%
+  filter(!is.na(identity)) %>%
+  separate_rows(identity, sep = ",") %>%
+  mutate(identity = as.numeric(identity)) %>%
+  mutate(gene = raw_gene %>%
+           str_remove_all("^x_|^_") %>%
+           str_remove_all("staphylococcus_aureus_") %>%
+           str_remove_all("pc1_beta_lactamase_") %>%
+           str_remove_all("\\(.*?\\)") %>%
+           str_remove_all("_\\d+$") %>%
+           str_remove_all("_number_sign") %>%
+           str_replace_all("_+", "_") %>%
+           str_trim() %>%
+           str_to_lower()) %>%
+  mutate(gene = case_when(
+    str_detect(gene, "blaz|bla_z|bla_bla|bla_i_of_z|bla_r1|bla_bla_r1") ~ "blaZ",
+    str_detect(gene, "^tet$|tet_tet|tet_?k") ~ "tetK",
+    str_detect(gene, "nor_?a|nor_c") ~ "norA",
+    str_detect(gene, "mec_?a") ~ "mecA",
+    str_detect(gene, "erm_?c") ~ "ermC",
+    str_detect(gene, "dfr_?g") ~ "dfrG",
+    str_detect(gene, "dfr_?c") ~ "dfrC",
+    str_detect(gene, "dfr_s1") ~ "dfrS1",
+    str_detect(gene, "aac_?6.*aph_?2|aph_?2.*aac|aac6_?ie_?aph2|aac_6_ie_aph_2_ia_bifunctional_protein") ~ "aac(6')-aph(2'')",
+    str_detect(gene, "a_gly_ap_h_stph|a_gly_str|a_gly_aad_c|str|aph_2_ii") ~ "aac(6')-aph(2'')",
+    str_detect(gene, "arl_r") ~ "arlR",
+    str_detect(gene, "arl_s") ~ "arlS",
+    str_detect(gene, "mep_a") ~ "mepA",
+    str_detect(gene, "mep_r") ~ "mepR",
+    str_detect(gene, "mgr_a") ~ "mgrA",
+    str_detect(gene, "sdr_m") ~ "sdrM",
+    str_detect(gene, "sep_a") ~ "sepA",
+    str_detect(gene, "kdp_d") ~ "kdpD",
+    str_detect(gene, "lmr_s") ~ "lmrS",
+    str_detect(gene, "phe_dha1") ~ "pheDha1",
+    str_detect(gene, "^tet") ~ "tetK",
+    TRUE ~ gene
+  )) %>%
+  mutate(gene = str_replace_all(gene, "_", "") %>% str_to_title()) %>%
+  mutate(gene = case_when(
+    gene == "Aminoglycosidemodifying" ~ "Aminoglycoside",
+    TRUE ~ gene
+  ))
+```
+
+# Final presence table
+```{r}
+amr_presence <- amr_clean %>%
+  mutate(barcode = str_extract(file, "barcode[0-9]+")) %>%
+  mutate(present = if_else(identity > 0, 1, 0)) %>%
+  group_by(barcode, gene) %>%
+  summarise(
+    max_identity = max(identity, na.rm = TRUE),
+    present      = max(present, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+# ── NEW: Prepare the heatmap matrix aligned to tree tips ──────────────────────
+
+```{r}
+# ---------- 1. Read & subset the tree ----------
+tree <- read.tree("iqtree_results/core_tree.treefile")
+
+keep_barcodes <- c("barcode04_all_reads",
+                   "barcode09_all_reads",
+                   "barcode19_all_reads",
+                   "barcode24_all_reads")
+
+tree_subset <- keep.tip(tree, keep_barcodes)
+print(tree_subset)
+```
+
+```{r}
+library(ape)
+
+# 1. Define your desired order
+desired_order <- c("barcode24", "barcode19", "barcode09", "barcode04")
+
+# 2. Reorder the tree object before plotting
+tree_subset <- rotateConstr(tree_subset, desired_order)
+
+# 3. Now run your existing plot code
+p_tree <- ggtree(tree_subset, branch.length = "branch.length") + 
+  geom_tiplab(size = 3, hjust = -0.05) + 
+  theme_tree2() + 
+  xlim(0, max(node.depth.edgelength(tree_subset)) * 1.6)
+
+p_tree
+```
+
+
+```{r}
+p_tree <- ggtree(tree_subset, branch.length = "branch.length") + 
+  # 1. Show Bootstrap Values at the nodes
+  # subset = !isTip ensures we only label internal branching points
+  geom_text2(aes(label = label, subset = !isTip), 
+             hjust = 1.2,   # Moves text slightly to the left of the node
+             vjust = -0.5,  # Moves text slightly above the branch
+             size = 3, 
+             color = "darkred") +
+  
+  # Your previous layers
+  geom_tiplab(aes(label = ""), align = TRUE, linetype = "dotted", color = "gray50") +
+  geom_tippoint(size = 2, color = "black") +
+  theme_tree2() + 
+  xlim(0, max(node.depth.edgelength(tree_subset)) * 1.2)
+
+p_tree
+```
+
+
+```{r}
+# ---------- 2. Build a short-label tip map ----------
+# Tree tips are like "barcode04_all_reads"; AMR data uses "barcode04"
+# We create a mapping so tip labels match barcode IDs in amr_presence.
+
+tip_map <- tibble(
+  tip_label = tree_subset$tip.label,
+  barcode   = str_extract(tip_label, "barcode[0-9]+")
+)
+
+# Rename tree tips to short barcode IDs so they match the heatmap rows
+tree_subset$tip.label <- tip_map$barcode
+```
+
+```{r}
+# ---------- 3. Pivot presence data into a wide matrix ----------
+# Rows = barcodes (must match tree tip labels exactly)
+# Columns = genes
+
+mat <- amr_presence %>%
+  filter(barcode %in% tree_subset$tip.label) %>%   # keep only barcodes in tree
+  select(barcode, gene, present) %>%
+  pivot_wider(names_from = gene, values_from = present, values_fill = 0) %>%
+  column_to_rownames("barcode")
+
+# Ensure row order matches the tree tip order
+mat <- mat[tree_subset$tip.label, , drop = FALSE]
+
+# Convert to numeric matrix (gheatmap requires this)
+mat <- as.matrix(mat)
+storage.mode(mat) <- "numeric"
+
+head(mat)
+```
+
+
+```{r}
+# 1. Extract the visual order of tips from the ggtree plot
+# This ensures the heatmap matches exactly what you see on the screen
+tip_order <- get_taxa_name(p_tree)
+
+# 2. Reorder your matrix rows based on that order
+mat_ordered <- mat[tip_order, , drop = FALSE]
+
+# 3. Draw the heatmap with the new order
+# Set cluster_rows = FALSE so it doesn't try to re-order them again
+library(ComplexHeatmap)
+
+Heatmap(mat_ordered, 
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_names_side = "top", 
+        column_names_rot = 45,
+        col = c("#f0f0f0", "#e31a1c"),
+        name = "AMR Gene Presence",
+        rect_gp = gpar(col = "white", lwd = 1),
+        border = TRUE
+)
+```
+
+
+```{r}
+library(ComplexHeatmap)
+
+Heatmap(mat_ordered, 
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_names_side = "top", 
+        column_names_rot = 45,
+        col = c("0" = "#f0f0f0", "1" = "#e31a1c"), # Explicitly mapping colors
+        name = "AMR Gene Presence",
+        rect_gp = gpar(col = "white", lwd = 1),
+        border = TRUE,
+        
+        # --- Update Legend Labels Here ---
+        heatmap_legend_param = list(
+          at = c(0, 1), 
+          labels = c("Absent", "Present")
+        )
+)
+```
+
+
+
+
+```{r}
+library(ggtree)
+
+# Basic tree without text
+p_tree <- ggtree(tree_subset) 
+
+# Add heatmap with automatically aligned grid lines
+gheatmap(p_tree, mat_ordered, offset = 0.01, width = 3.5, 
+         colnames_angle = 45, colnames_offset_y = 0.2)
+```
+
+
