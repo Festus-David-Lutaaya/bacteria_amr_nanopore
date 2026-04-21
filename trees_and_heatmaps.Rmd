@@ -1,6 +1,6 @@
 ---
 title: "plotting_tree_in_R"
-author: "ijjL."
+author: "Festud David L"
 date: "2026-04-19"
 output: pdf_document
 ---
